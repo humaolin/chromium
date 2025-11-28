@@ -90,24 +90,27 @@ jobs:
           # 让后续步骤能直接使用 cipd & gclient
           echo "${DEPOT_TOOLS_DIR}" >> $GITHUB_PATH
           echo "cipd installed to ${DEPOT_TOOLS_DIR}/cipd"
-      - name: gclient config & sync (fetch dependencies)
-        # NOTE: gclient sync 会下载 Chromium 及大量依赖，可能占用数十 GB
+      - name: Fetch Chromium and sync deps (ensure cipd)
+        shell: bash
         run: |
-          # 进入源码目录（actions checkout 已检出 ungoogled-chromium to $GITHUB_WORKSPACE）
-          cd $GITHUB_WORKSPACE
-          # If the repo uses a custom gclient config file or scripts, follow them.
-          # The following is a safe generic approach — adjust per docs/building.md if needed.
-          # Ensure depot_tools in PATH
-          export PATH="${DEPOT_TOOLS_DIR}:$PATH"
-          # If the repo already contains .gclient or hooks, gclient will honor them.
-          # Sync (this can be long and heavy)
-          if command -v gclient >/dev/null 2>&1; then
-            echo "Running gclient sync (this may take a long time)..."
-            gclient sync --with_branch_heads --with_tags --jobs 4
-          else
-            echo "gclient not found in PATH -- depot_tools not configured correctly"
-            exit 1
-          fi
+          set -euo pipefail
+          DEPOT_TOOLS="${RUNNER_TEMP}/depot_tools"
+          mkdir -p "${DEPOT_TOOLS}"
+          export PATH="${DEPOT_TOOLS}:$PATH"
+
+          # 下载 cipd
+          curl -fLsS "https://chrome-infra-packages.appspot.com/client?platform=linux-arm64" -o "${DEPOT_TOOLS}/cipd"
+          chmod +x "${DEPOT_TOOLS}/cipd"
+
+          # 确认 cipd 可用
+          which cipd
+
+          # 拉源码
+          fetch --nohooks chromium
+          cd src
+
+          # 同步依赖
+          gclient sync --with_branch_heads --no-history
         shell: bash
 
       - name: Prepare GN args
