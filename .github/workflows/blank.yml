@@ -69,7 +69,27 @@ jobs:
         run: |
           git config --global --add safe.directory $GITHUB_WORKSPACE
         shell: bash
-
+      - name: Ensure cipd client (for linux/arm64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 设定 DEPOT_TOOLS_DIR（与你 workflow 中的同名 env 保持一致）
+          DEPOT_TOOLS_DIR="${{ runner.temp }}/depot_tools"
+          mkdir -p "${DEPOT_TOOLS_DIR}"
+          # 选择合适的平台标识（github runner 上 arm64 通常是 linux-arm64）
+          PLATFORM="linux-arm64"
+          # CIPD backend URL (depot_tools bootstrap 脚本也是用类似的 URL)
+          CIPD_BACKEND="https://chrome-infra-packages.appspot.com"
+          # 下载 endpoint: /client?platform=<platform>&version=git_revision:<any>
+          # 这里用 curl 下载最新可用客户端二进制（bootstrap 脚本也类似）
+          CIPD_URL="${CIPD_BACKEND}/client?platform=${PLATFORM}"
+          echo "Downloading cipd from: ${CIPD_URL}"
+          # 跳过证书问题时请谨慎；默认 curl 应该可用
+          curl -fLsS -o "${DEPOT_TOOLS_DIR}/cipd" "${CIPD_URL}"
+          chmod +x "${DEPOT_TOOLS_DIR}/cipd"
+          # 让后续步骤能直接使用 cipd & gclient
+          echo "${DEPOT_TOOLS_DIR}" >> $GITHUB_PATH
+          echo "cipd installed to ${DEPOT_TOOLS_DIR}/cipd"
       - name: gclient config & sync (fetch dependencies)
         # NOTE: gclient sync 会下载 Chromium 及大量依赖，可能占用数十 GB
         run: |
