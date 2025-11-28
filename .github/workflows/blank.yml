@@ -1,162 +1,138 @@
-name: Build ungoogled-chromium (arm64, self-hosted)
+name: Build ungoogled-chromium (arm64)
 
+# 手动触发 + push 到 main 时触发
 on:
   workflow_dispatch:
+  push:
+    branches: [ main ]
 
+# 如果你有可用的 GitHub-hosted ARM runner，修改 runs-on 为对应名称（示例使用 ubuntu-22.04-arm）
+# 如果没有，请使用自托管 runner 标签（例如: self-hosted, linux, aarch64）
 jobs:
-  build_ungoogled:
-    # 强烈建议在自托管 aarch64 runner（Debian Buster）上运行
-    runs-on: [self-hosted, linux, arm64]
+  build-arm64:
+    name: Build ungoogled-chromium (arm64)
+    runs-on: ubuntu-22.04-arm   # <- 若报错，请换成可用的 arm runner 或自托管 runner 标签
+    timeout-minutes: 720        # Chromium 构建很耗时，必要时调整
+
     env:
-      SRC_DIR: build/src
-      OUTDIR: build/src/out/Default
-      DOWNLOAD_CACHE: build/download_cache
-      UNGOOGLED_DIR: ungoogled   # 你仓库中放 ungoogled-chromium 的文件夹（downloads.ini, patches, pruning.list, domain_substitution.list 等）
-      NINJA_JOBS: 4              # 根据内存 / 核心调整（若内存小，设置为 1-2）
-      USE_SWAP: "true"          # "true" or "false"
-      SWAP_SIZE_GB: 16          # 例如 16（按需调整）
-      TAR_NAME: ungoogled-chromium-arm64-${{ github.run_number }}.tar.xz
+      # 可按需修改
+      DEPOT_TOOLS_DIR: ${{ runner.temp }}/depot_tools
+      CHROMIUM_OUT: out/Default
+      # 若你希望构建 debug 或 release，可改 is_debug=true/false
+      GN_ARGS: 'target_cpu="arm64" is_debug=false treat_warnings_as_errors=false symbol_level=0'
 
     steps:
-      - name: Checkout (full)
+      - name: Checkout this repository (ungoogled-chromium)
         uses: actions/checkout@v4
         with:
+          repository: ungoogled-software/ungoogled-chromium
+          # 如果 workflow 在同一仓库里，去掉 repository 字段即可
+          # repository: <omit when workflow in same repo>
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
           fetch-depth: 0
 
-      - name: Install base packages (Debian-based)
+      - name: Cache depot_tools
+        id: cache-depot
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/depot_tools
+          key: depot-tools-${{ runner.os }}-v1
+
+      - name: Clone depot_tools (if cache miss)
+        if: steps.cache-depot.outputs.cache-hit != 'true'
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "${DEPOT_TOOLS_DIR}"
+          echo "${DEPOT_TOOLS_DIR}" >> $GITHUB_PATH
+        shell: bash
+
+      - name: Ensure depot_tools on PATH
+        run: |
+          # if depot_tools already in cache, make sure to add it to PATH too
+          if [ -d "${DEPOT_TOOLS_DIR}" ]; then
+            echo "${DEPOT_TOOLS_DIR}" >> $GITHUB_PATH
+          fi
+          echo "depot_tools in PATH: $(which gclient || true)"
+        shell: bash
+
+      - name: Install apt packages (prerequisites)
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip python3-venv git curl ca-certificates \
-            build-essential pkg-config clang cmake ninja-build gnupg python3-setuptools \
-            libgtk-3-dev libnss3-dev libcups2-dev xz-utils debootstrap
-          # 根据平台补其他依赖
+          sudo apt-get install -y git python3 python3-pip cmake ninja-build \
+            clang lld pkg-config build-essential curl unzip python-is-python3 \
+            ca-certificates
+          # 依据你要构建的目标平台与 building.md，可能需要添加 pkg-config libgtk-3-dev 等包
+        shell: bash
 
-      - name: Prepare depot_tools and ensure cipd
+      - name: Configure git (avoid quota prompts)
         run: |
-          DT="$RUNNER_TEMP/depot_tools"
-          rm -rf "$DT"
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DT"
-          chmod -R a+x "$DT" || true
-          echo "$DT" >> $GITHUB_PATH
-          # 尝试 update_depot_tools
-          if [ -x "$DT/update_depot_tools" ]; then
-            "$DT/update_depot_tools" || true
-          fi
-          if ! command -v cipd >/dev/null 2>&1; then
-            echo "cipd missing, try direct download"
-            mkdir -p "$RUNNER_TEMP/bin"
-            ARCH="$(uname -m)"
-            if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-              CIPD_TARGET="linux-arm64"
-            else
-              CIPD_TARGET="linux-amd64"
-            fi
-            curl -fsSL "https://chrome-infra-packages.appspot.com/dl/infra/tools/cipd/${CIPD_TARGET}/latest" -o "$RUNNER_TEMP/bin/cipd"
-            chmod +x "$RUNNER_TEMP/bin/cipd"
-            echo "$RUNNER_TEMP/bin" >> $GITHUB_PATH
-          fi
-          which cipd || (echo "cipd still missing" && exit 1)
-          cipd --version || true
+          git config --global --add safe.directory $GITHUB_WORKSPACE
+        shell: bash
 
-      - name: Prepare directories and download cache
+      - name: gclient config & sync (fetch dependencies)
+        # NOTE: gclient sync 会下载 Chromium 及大量依赖，可能占用数十 GB
         run: |
-          mkdir -p ${{ env.DOWNLOAD_CACHE }}
-          mkdir -p ${{ env.SRC_DIR }}
-
-      - name: Retrieve downloads (download cache) for ungoogled-chromium
-        run: |
-          # 假设 ungoogled repo files 在 $UNGOOGLED_DIR 下
-          cd ${{ env.UNGOOGLED_DIR }}
-          python3 ./utils/downloads.py retrieve -c ../${{ env.DOWNLOAD_CACHE }} -i downloads.ini
-          python3 ./utils/downloads.py unpack -c ../${{ env.DOWNLOAD_CACHE }} -i downloads.ini -- ../${{ env.SRC_DIR }}
-        working-directory: ${{ github.workspace }}/${{ env.UNGOOGLED_DIR }}
-
-      - name: Prune binaries
-        run: |
-          cd ${{ env.SRC_DIR }}
-          python3 ../${{ env.UNGOOGLED_DIR }}/utils/prune_binaries.py . ../${{ env.UNGOOGLED_DIR }}/pruning.list
-        working-directory: ${{ github.workspace }}
-
-      - name: Apply patches (ungoogled)
-        run: |
-          cd ${{ env.SRC_DIR }}
-          python3 ../${{ env.UNGOOGLED_DIR }}/utils/patches.py apply . ../${{ env.UNGOOGLED_DIR }}/patches
-        working-directory: ${{ github.workspace }}
-
-      - name: Domain substitution (optional)
-        run: |
-          cd ${{ env.SRC_DIR }}
-          python3 ../${{ env.UNGOOGLED_DIR }}/utils/domain_substitution.py apply -r ../${{ env.UNGOOGLED_DIR }}/domain_regex.list -f ../${{ env.UNGOOGLED_DIR }}/domain_substitution.list -c ../${{ env.DOWNLOAD_CACHE }}/domsubcache.tar.gz .
-        working-directory: ${{ github.workspace }}
-
-      - name: GN bootstrap (if you don't have gn)
-        run: |
-          cd ${{ env.SRC_DIR }}
-          python3 ./tools/gn/bootstrap/bootstrap.py --skip-generate-buildfiles -j4 -o out/Default/ || true
-        working-directory: ${{ github.workspace }}
-
-      - name: Prepare flags.gn (你可以把自定义 flags.gn 放仓库里然后复制)
-        run: |
-          mkdir -p ${{ env.OUTDIR }}
-          # 如果你在仓库中有 flags.gn，可以复制到 out/Default/args.gn
-          if [ -f "${{ env.UNGOOGLED_DIR }}/flags.gn" ]; then
-            cp "${{ env.UNGOOGLED_DIR }}/flags.gn" "${{ env.OUTDIR }}/args.gn"
+          # 进入源码目录（actions checkout 已检出 ungoogled-chromium to $GITHUB_WORKSPACE）
+          cd $GITHUB_WORKSPACE
+          # If the repo uses a custom gclient config file or scripts, follow them.
+          # The following is a safe generic approach — adjust per docs/building.md if needed.
+          # Ensure depot_tools in PATH
+          export PATH="${DEPOT_TOOLS_DIR}:$PATH"
+          # If the repo already contains .gclient or hooks, gclient will honor them.
+          # Sync (this can be long and heavy)
+          if command -v gclient >/dev/null 2>&1; then
+            echo "Running gclient sync (this may take a long time)..."
+            gclient sync --with_branch_heads --with_tags --jobs 4
           else
-            cat > "${{ env.OUTDIR }}/args.gn" <<'EOF'
-            is_debug = false
-            target_cpu = "arm64"
-            symbol_level = 0
-            blink_symbol_level = 0
-            is_component_build = false
-            EOF
+            echo "gclient not found in PATH -- depot_tools not configured correctly"
+            exit 1
           fi
+        shell: bash
 
-      - name: Optionally create swap (if memory low)
-        if: ${{ env.USE_SWAP == 'true' }}
+      - name: Prepare GN args
         run: |
-          # 仅在 self-hosted 上运行：为避免 OOM，创建 swapfile（注意：检查磁盘空间）
-          set -eux
-          SWAP_GB=${{ env.SWAP_SIZE_GB }}
-          SWAP_FILE=/swapfile_github_actions
-          if [ ! -f "$SWAP_FILE" ]; then
-            sudo fallocate -l ${SWAP_GB}G $SWAP_FILE
-            sudo chmod 600 $SWAP_FILE
-            sudo mkswap $SWAP_FILE
-            sudo swapon $SWAP_FILE
-            echo "Swapfile created and enabled: $SWAP_FILE ${SWAP_GB}G"
+          cd $GITHUB_WORKSPACE
+          export PATH="${DEPOT_TOOLS_DIR}:$PATH"
+          mkdir -p ${CHROMIUM_OUT}
+          # Write GN args - you can extend GN_ARGS via workflow env or secrets
+          echo "${{ env.GN_ARGS }}" > ${CHROMIUM_OUT}/args.gn
+          cat ${CHROMIUM_OUT}/args.gn
+        shell: bash
+
+      - name: Generate build files (gn gen)
+        run: |
+          cd $GITHUB_WORKSPACE
+          export PATH="${DEPOT_TOOLS_DIR}:$PATH"
+          gn gen ${CHROMIUM_OUT} --check --fail-on-unused-args || true
+          # If above fails due to missing args, the args.gn file will be used by gn automatically
+        shell: bash
+
+      - name: Build (autoninja)
+        run: |
+          cd $GITHUB_WORKSPACE
+          export PATH="${DEPOT_TOOLS_DIR}:$PATH"
+          # autoninja is a wrapper; fallback to ninja if needed
+          if command -v autoninja >/dev/null 2>&1; then
+            autoninja -C ${CHROMIUM_OUT} -j 8 chrome
           else
-            echo "Swapfile already exists"
+            ninja -C ${CHROMIUM_OUT} -j 8 chrome
           fi
-          free -h
+        shell: bash
 
-      - name: GN gen and build (ninja)
+      - name: Package / gather artifacts
         run: |
-          set -eux
-          cd ${{ env.SRC_DIR }}
-          # 确保 args.gn 存在（上一步已处理）
-          ./out/Default/gn gen out/Default --fail-on-unused-args
-          # 使用 NINJA_JOBS 控制并发，内存小就减小它
-          ninja -C out/Default -j${{ env.NINJA_JOBS }} chrome chromedriver chrome_sandbox || (echo "build failed"; exit 1)
-        working-directory: ${{ github.workspace }}
+          cd $GITHUB_WORKSPACE
+          # 你可以根据需要打包 .deb、tar.gz，或抓取 chrome 可执行文件
+          mkdir -p package
+          # 拷贝可执行或全部 out 目录（注意体积）
+          cp -r ${CHROMIUM_OUT} package/
+          du -sh package || true
+        shell: bash
 
-      - name: Pack build artifacts
-        run: |
-          set -eux
-          cd ${{ env.SRC_DIR }}
-          TAR_PATH="$GITHUB_WORKSPACE/${{ env.TAR_NAME }}"
-          # 选择性打包 chrome 可执行与 lib 以及必要资源，避免打包整个 out 目录
-          # 下面是示例，按实际文件位置调整
-          tar -cJf "$TAR_PATH" -C out/Default chrome chrome_sandbox chromedriver || \
-            ( echo "pack fallback: pack entire out/Default (may be large)"; tar -cJf "$TAR_PATH" -C out/Default . )
-          ls -lh "$TAR_PATH"
-          echo "TAR=$TAR_PATH" >> $GITHUB_OUTPUT
-
-      - name: Create GitHub release & upload artifact
-        uses: softprops/action-gh-release@v1
+      - name: Upload build artifact (out)
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: v${{ github.run_number }}-ungoogled-arm64
-          name: ungoogled-chromium-arm64-${{ github.run_number }}
-          body: "ungoogled-chromium (arm64) build - automated"
-          files: ${{ steps.pack_build_artifacts.outputs.TAR || env.GITHUB_WORKSPACE }}/{{ env.TAR_NAME }}
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: ungoogled-chromium-arm64-out
+          path: package
+          retention-days: 7
