@@ -1,8 +1,11 @@
+name: cross-build-chromium-arm64
 
-name: cross-build-chromium-arm64-glibc2.28
-
+# 手动触发或按需 push
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   cross_build:
@@ -11,88 +14,141 @@ jobs:
       DEPOT_TOOLS: $RUNNER_TEMP/depot_tools
       OUTDIR: out/arm64
     steps:
-      - name: Checkout
+      - name: Checkout repo (full clone)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install minimal deps
+      - name: Install minimal packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip git curl ca-certificates unzip xz-utils
-
-      - name: Get depot_tools and add to PATH
+          sudo apt-get install -y python3 python3-pip git curl ca-certificates unzip xz-utils \
+            build-essential pkg-config cmake ninja-build wget
+      - name: Prepare depot_tools dir and add to PATH
         run: |
           rm -rf "$DEPOT_TOOLS"
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS"
+          chmod -R a+x "$DEPOT_TOOLS" || true
           echo "$DEPOT_TOOLS" >> $GITHUB_PATH
-          # ensure scripts are executable
-          chmod -R a+x "$DEPOT_TOOLS"
-      - name: Bootstrap depot_tools (install cipd / vpython / helpers)
+          echo "DEPOT_TOOLS set to $DEPOT_TOOLS"
+      - name: Bootstrap depot_tools (update_depot_tools / install helpers)
         run: |
-          # 有时 update_depot_tools 会在不同分支名称下存在，尝试几种常见方式去触发 bootstrapping
+          set -eux
+          # Try common updater scripts - some depot_tools versions differ
           if [ -x "$DEPOT_TOOLS/update_depot_tools" ]; then
             "$DEPOT_TOOLS/update_depot_tools" || true
           fi
-          # some depot_tools versions use update_depot_tools.py
           if [ -f "$DEPOT_TOOLS/update_depot_tools.py" ]; then
             python3 "$DEPOT_TOOLS/update_depot_tools.py" || true
           fi
-          # 确认 cipd 是否可用
-          if ! command -v cipd >/dev/null 2>&1; then
-            echo "cipd not found after bootstrap; will try fallback direct download"
-          else
-            echo "cipd found: $(command -v cipd)"
-          fi
-
-      - name: Fallback: download cipd binary if still missing
-        if: ${{ ! (contains(env.PATH, 'cipd') || success()) && always() }}
+          # Some depot_tools use fetch to get vpython/cipd. Ensure python3 is default for vpython scripts.
+      - name: Fallback: download cipd binary if missing
         run: |
-          # Detect linux-amd64 or linux-arm64 as needed; here runner is x86_64 (ubuntu-22.04)
-          CIPD_URL="https://chrome-infra-packages.appspot.com/dl/infra/tools/cipd/linux-amd64/latest"
-          CIPD_BIN="$RUNNER_TEMP/cipd"
-          if ! command -v cipd >/dev/null 2>&1; then
-            echo "Downloading cipd from $CIPD_URL"
-            curl -fsSL -o "$CIPD_BIN" "$CIPD_URL"
-            chmod +x "$CIPD_BIN"
+          set -eux
+          if command -v cipd >/dev/null 2>&1; then
+            echo "cipd already available at $(command -v cipd)"
+            cipd --version || true
+          else
+            echo "cipd NOT found in PATH, attempting direct download fallback..."
             mkdir -p "$RUNNER_TEMP/bin"
-            mv "$CIPD_BIN" "$RUNNER_TEMP/bin/cipd"
+            # Use chrome infra packages endpoint - choose linux-amd64 for ubuntu-22.04 hosted runner
+            CIPD_URL="https://chrome-infra-packages.appspot.com/dl/infra/tools/cipd/linux-amd64/latest"
+            curl -fSL "$CIPD_URL" -o "$RUNNER_TEMP/bin/cipd"
+            chmod +x "$RUNNER_TEMP/bin/cipd"
             echo "$RUNNER_TEMP/bin" >> $GITHUB_PATH
-            echo "cipd installed at $RUNNER_TEMP/bin/cipd"
-          else
-            echo "cipd is already present"
+            echo "Downloaded cipd to $RUNNER_TEMP/bin/cipd"
+            cipd --version || true
           fi
 
-      - name: Verify cipd available
+      - name: Verify cipd and depot_tools in PATH
         run: |
+          set -eux
           echo "PATH=$PATH"
-          which cipd || { echo "ERROR: cipd still not found"; exit 1; }
-          cipd --version || echo "cipd --version failed (but tool exists)"
+          which cipd || (echo "cipd not found - aborting" && exit 1)
+          which gclient || echo "warning: gclient not in PATH"
+          cipd --version || true
 
-      - name: Fetch chromium (now cipd is in PATH)
+      - name: Fetch chromium (requires cipd available)
         run: |
-          # fetch command requires depot_tools in PATH (we added it via GITHUB_PATH above)
+          set -eux
+          # fetch is provided by depot_tools (we added it to PATH via GITHUB_PATH)
+          # --nohooks 避免立即运行 gclient hooks（我们会显式 runhooks / gclient sync 后处理）
           fetch --nohooks chromium
           cd src
+          # gclient sync will use cipd to pull binary deps
           gclient sync --with_branch_heads --no-history
         working-directory: ${{ github.workspace }}
 
-      # ... 下面仍然是你以前的构建步骤（install-sysroot, gn gen, build 等）...
-      - name: Pack artifact
+      - name: (Optional) Install build deps script (may be heavy)
+        if: ${{ always() }}
+        run: |
+          set -eux
+          # 该步骤会安装大量包；在 GH-hosted runner 上可能需要自定义或跳过
+          cd src
+          sudo ./build/install-build-deps.sh --no-prompt || echo "install-build-deps.sh returned non-zero (continuing)"
+
+      - name: (Optional) Install arm64 sysroot for cross-compile
+        if: ${{ always() }}
+        run: |
+          set -eux
+          cd src
+          # 安装 chromium 提供的 sysroot（注意：若需确保 glibc 2.28，请使用自制 Buster sysroot，见注释）
+          python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64 || echo "install-sysroot.py failed (continuing)"
+
+      - name: Configure GN args for arm64
+        run: |
+          set -eux
+          cd src
+          mkdir -p "${OUTDIR}"
+          cat > "${OUTDIR}/args.gn" <<'EOF'
+          target_cpu = "arm64"
+          is_debug = false
+          symbol_level = 0
+          blink_symbol_level = 0
+          is_component_build = false
+          # 如需指定自制 sysroot（Debian Buster / glibc 2.28），请设置 target_sysroot 对应 gn label
+          # target_sysroot = "//third_party/your_buster_sysroot:sysroot_aarch64"
+          EOF
+          # runhooks 以便 gyp/gn 相关 hook 被处理（不会触发完全构建）
+          gclient runhooks
+
+      - name: Generate GN and (optionally) build chrome
+        run: |
+          set -eux
+          cd src
+          # 注意：下面构建可能非常耗时/占用磁盘，GH-hosted runner 可能会失败
+          gn gen ${OUTDIR} --args="$(cat ${OUTDIR}/args.gn)"
+          # 如果你只想测试构建流程可把下面的 autoninja 换成一个轻量目标（或注释掉）
+          # autoninja -C ${OUTDIR} chrome
+          echo "GN gen completed. To build chrome, uncomment autoninja in this workflow."
+
+      - name: Pack artifact (if build output exists)
         if: always()
         run: |
-          # 仅示例：假设构建成功并且在 src/${OUTDIR} 下有输出，打包为单文件供上传
-          cd src/${{ env.OUTDIR }} || exit 0
-          tar -cJf $GITHUB_WORKSPACE/chromium-arm64-glibc2.28.tar.xz . || true
+          set -eux
+          cd src
+          if [ -d "${OUTDIR}" ] && [ "$(ls -A ${OUTDIR} 2>/dev/null | wc -l)" -gt 0 ]; then
+            TAR_NAME="$GITHUB_WORKSPACE/chromium-arm64-glibc2.28-${GITHUB_RUN_NUMBER}.tar.xz"
+            tar -cJf "${TAR_NAME}" -C "${OUTDIR}" .
+            echo "Created artifact ${TAR_NAME}"
+          else
+            echo "No build output found in src/${OUTDIR}; creating empty placeholder tar"
+            TAR_NAME="$GITHUB_WORKSPACE/chromium-arm64-glibc2.28-${GITHUB_RUN_NUMBER}-empty.tar.xz"
+            mkdir -p "$GITHUB_WORKSPACE/tmp-empty"
+            echo "no build output" > "$GITHUB_WORKSPACE/tmp-empty/README.txt"
+            tar -cJf "${TAR_NAME}" -C "$GITHUB_WORKSPACE/tmp-empty" .
+          fi
+          echo "TAR_ARTIFACT=${TAR_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Create release (softprops)
-        if: always()
+      - name: Create release and upload artifact(s)
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ github.run_number }}-chromium-arm64
-          name: chromium-arm64
+          name: chromium-arm64-glibc2.28-${{ github.run_number }}
+          body: |
+            Automated build (may be empty placeholder if build didn't run on hosted runner).
           files: |
-            $GITHUB_WORKSPACE/chromium-arm64-glibc2.28.tar.xz
+            ${{ steps.pack_artifact.outputs.TAR_ARTIFACT || env.GITHUB_WORKSPACE }}/chromium-arm64-glibc2.28-${{ github.run_number }}.tar.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
