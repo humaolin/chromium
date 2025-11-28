@@ -1,168 +1,162 @@
-name: cross-build-chromium-arm64
+name: Build ungoogled-chromium (arm64, self-hosted)
 
-# 手动触发或按需 push
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
 
 jobs:
-  cross_build:
-    runs-on: ubuntu-22.04
+  build_ungoogled:
+    # 强烈建议在自托管 aarch64 runner（Debian Buster）上运行
+    runs-on: [self-hosted, linux, arm64]
     env:
-      DEPOT_TOOLS: $RUNNER_TEMP/depot_tools
-      OUTDIR: out/arm64
+      SRC_DIR: build/src
+      OUTDIR: build/src/out/Default
+      DOWNLOAD_CACHE: build/download_cache
+      UNGOOGLED_DIR: ungoogled   # 你仓库中放 ungoogled-chromium 的文件夹（downloads.ini, patches, pruning.list, domain_substitution.list 等）
+      NINJA_JOBS: 4              # 根据内存 / 核心调整（若内存小，设置为 1-2）
+      USE_SWAP: "true"          # "true" or "false"
+      SWAP_SIZE_GB: 16          # 例如 16（按需调整）
+      TAR_NAME: ungoogled-chromium-arm64-${{ github.run_number }}.tar.xz
+
     steps:
-      - name: Checkout repo (full clone)
+      - name: Checkout (full)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Install OS deps (python venv + essentials)
+      - name: Install base packages (Debian-based)
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip python3-venv python3-virtualenv \
-            git curl ca-certificates unzip xz-utils build-essential
+          sudo apt-get install -y python3 python3-pip python3-venv git curl ca-certificates \
+            build-essential pkg-config clang cmake ninja-build gnupg python3-setuptools \
+            libgtk-3-dev libnss3-dev libcups2-dev xz-utils debootstrap
+          # 根据平台补其他依赖
 
-      - name: Prepare depot_tools and add to PATH
+      - name: Prepare depot_tools and ensure cipd
         run: |
-          DEPOT_TOOLS="$RUNNER_TEMP/depot_tools"
-          rm -rf "$DEPOT_TOOLS"
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS"
-          chmod -R a+x "$DEPOT_TOOLS" || true
-          echo "$DEPOT_TOOLS" >> $GITHUB_PATH
-          echo "Added depot_tools to PATH: $DEPOT_TOOLS"
-
-      - name: Try update_depot_tools (may install cipd/vpython)
-        run: |
-          set -eux
           DT="$RUNNER_TEMP/depot_tools"
+          rm -rf "$DT"
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DT"
+          chmod -R a+x "$DT" || true
+          echo "$DT" >> $GITHUB_PATH
+          # 尝试 update_depot_tools
           if [ -x "$DT/update_depot_tools" ]; then
             "$DT/update_depot_tools" || true
           fi
-          if [ -f "$DT/update_depot_tools.py" ]; then
-            python3 "$DT/update_depot_tools.py" || true
-          fi
-          # small sleep for filesystem to settle
-          sleep 1
-
-      - name: Ensure cipd in PATH (fallback download)
-        run: |
-          set -eux
-          # make bin dir in runner temp and add to PATH
-          mkdir -p "$RUNNER_TEMP/bin"
-          echo "$RUNNER_TEMP/bin" >> $GITHUB_PATH
-
-          if command -v cipd >/dev/null 2>&1; then
-            echo "cipd already present at $(command -v cipd)"
-            cipd --version || true
-          else
-            echo "cipd not found — downloading fallback binary"
+          if ! command -v cipd >/dev/null 2>&1; then
+            echo "cipd missing, try direct download"
+            mkdir -p "$RUNNER_TEMP/bin"
             ARCH="$(uname -m)"
-            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
-              CIPD_TARGET="linux-amd64"
-            elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
               CIPD_TARGET="linux-arm64"
             else
-              echo "Unsupported arch: $ARCH" && exit 1
+              CIPD_TARGET="linux-amd64"
             fi
-            CIPD_URL="https://chrome-infra-packages.appspot.com/dl/infra/tools/cipd/${CIPD_TARGET}/latest"
-            curl -fsSL "$CIPD_URL" -o "$RUNNER_TEMP/bin/cipd"
+            curl -fsSL "https://chrome-infra-packages.appspot.com/dl/infra/tools/cipd/${CIPD_TARGET}/latest" -o "$RUNNER_TEMP/bin/cipd"
             chmod +x "$RUNNER_TEMP/bin/cipd"
-            echo "Downloaded cipd to $RUNNER_TEMP/bin/cipd"
-            cipd --version || true
+            echo "$RUNNER_TEMP/bin" >> $GITHUB_PATH
           fi
+          which cipd || (echo "cipd still missing" && exit 1)
+          cipd --version || true
 
-      - name: Verify cipd & depot_tools tools
+      - name: Prepare directories and download cache
         run: |
-          set -eux
-          echo "PATH=$PATH"
-          which cipd || (echo "ERROR: cipd missing" && exit 1)
-          cipd --version
-          which fetch || echo "warning: fetch (depot_tools) not found in PATH"
-          which gclient || echo "warning: gclient not found in PATH"
+          mkdir -p ${{ env.DOWNLOAD_CACHE }}
+          mkdir -p ${{ env.SRC_DIR }}
 
-      - name: Fetch chromium (nohooks)
+      - name: Retrieve downloads (download cache) for ungoogled-chromium
         run: |
-          set -eux
-          # fetch provided by depot_tools; requires cipd in PATH
-          fetch --nohooks chromium
-          cd src
-          # gclient sync uses cipd to pull binary deps
-          gclient sync --with_branch_heads --no-history
+          # 假设 ungoogled repo files 在 $UNGOOGLED_DIR 下
+          cd ${{ env.UNGOOGLED_DIR }}
+          python3 ./utils/downloads.py retrieve -c ../${{ env.DOWNLOAD_CACHE }} -i downloads.ini
+          python3 ./utils/downloads.py unpack -c ../${{ env.DOWNLOAD_CACHE }} -i downloads.ini -- ../${{ env.SRC_DIR }}
+        working-directory: ${{ github.workspace }}/${{ env.UNGOOGLED_DIR }}
+
+      - name: Prune binaries
+        run: |
+          cd ${{ env.SRC_DIR }}
+          python3 ../${{ env.UNGOOGLED_DIR }}/utils/prune_binaries.py . ../${{ env.UNGOOGLED_DIR }}/pruning.list
         working-directory: ${{ github.workspace }}
 
-      - name: (Optional) Install build deps script (may be heavy)
-        if: ${{ always() }}
+      - name: Apply patches (ungoogled)
         run: |
-          set -eux
-          # 该步骤会安装大量包；在 GH-hosted runner 上可能需要自定义或跳过
-          cd src
-          sudo ./build/install-build-deps.sh --no-prompt || echo "install-build-deps.sh returned non-zero (continuing)"
+          cd ${{ env.SRC_DIR }}
+          python3 ../${{ env.UNGOOGLED_DIR }}/utils/patches.py apply . ../${{ env.UNGOOGLED_DIR }}/patches
+        working-directory: ${{ github.workspace }}
 
-      - name: (Optional) Install arm64 sysroot for cross-compile
-        if: ${{ always() }}
+      - name: Domain substitution (optional)
         run: |
-          set -eux
-          cd src
-          # 安装 chromium 提供的 sysroot（注意：若需确保 glibc 2.28，请使用自制 Buster sysroot，见注释）
-          python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64 || echo "install-sysroot.py failed (continuing)"
+          cd ${{ env.SRC_DIR }}
+          python3 ../${{ env.UNGOOGLED_DIR }}/utils/domain_substitution.py apply -r ../${{ env.UNGOOGLED_DIR }}/domain_regex.list -f ../${{ env.UNGOOGLED_DIR }}/domain_substitution.list -c ../${{ env.DOWNLOAD_CACHE }}/domsubcache.tar.gz .
+        working-directory: ${{ github.workspace }}
 
-      - name: Configure GN args for arm64
+      - name: GN bootstrap (if you don't have gn)
         run: |
-          set -eux
-          cd src
-          mkdir -p "${OUTDIR}"
-          cat > "${OUTDIR}/args.gn" <<'EOF'
-          target_cpu = "arm64"
-          is_debug = false
-          symbol_level = 0
-          blink_symbol_level = 0
-          is_component_build = false
-          # 如需指定自制 sysroot（Debian Buster / glibc 2.28），请设置 target_sysroot 对应 gn label
-          # target_sysroot = "//third_party/your_buster_sysroot:sysroot_aarch64"
-          EOF
-          # runhooks 以便 gyp/gn 相关 hook 被处理（不会触发完全构建）
-          gclient runhooks
+          cd ${{ env.SRC_DIR }}
+          python3 ./tools/gn/bootstrap/bootstrap.py --skip-generate-buildfiles -j4 -o out/Default/ || true
+        working-directory: ${{ github.workspace }}
 
-      - name: Generate GN and (optionally) build chrome
+      - name: Prepare flags.gn (你可以把自定义 flags.gn 放仓库里然后复制)
         run: |
-          set -eux
-          cd src
-          # 注意：下面构建可能非常耗时/占用磁盘，GH-hosted runner 可能会失败
-          gn gen ${OUTDIR} --args="$(cat ${OUTDIR}/args.gn)"
-          # 如果你只想测试构建流程可把下面的 autoninja 换成一个轻量目标（或注释掉）
-          # autoninja -C ${OUTDIR} chrome
-          echo "GN gen completed. To build chrome, uncomment autoninja in this workflow."
-
-      - name: Pack artifact (if build output exists)
-        if: always()
-        run: |
-          set -eux
-          cd src
-          if [ -d "${OUTDIR}" ] && [ "$(ls -A ${OUTDIR} 2>/dev/null | wc -l)" -gt 0 ]; then
-            TAR_NAME="$GITHUB_WORKSPACE/chromium-arm64-glibc2.28-${GITHUB_RUN_NUMBER}.tar.xz"
-            tar -cJf "${TAR_NAME}" -C "${OUTDIR}" .
-            echo "Created artifact ${TAR_NAME}"
+          mkdir -p ${{ env.OUTDIR }}
+          # 如果你在仓库中有 flags.gn，可以复制到 out/Default/args.gn
+          if [ -f "${{ env.UNGOOGLED_DIR }}/flags.gn" ]; then
+            cp "${{ env.UNGOOGLED_DIR }}/flags.gn" "${{ env.OUTDIR }}/args.gn"
           else
-            echo "No build output found in src/${OUTDIR}; creating empty placeholder tar"
-            TAR_NAME="$GITHUB_WORKSPACE/chromium-arm64-glibc2.28-${GITHUB_RUN_NUMBER}-empty.tar.xz"
-            mkdir -p "$GITHUB_WORKSPACE/tmp-empty"
-            echo "no build output" > "$GITHUB_WORKSPACE/tmp-empty/README.txt"
-            tar -cJf "${TAR_NAME}" -C "$GITHUB_WORKSPACE/tmp-empty" .
+            cat > "${{ env.OUTDIR }}/args.gn" <<'EOF'
+            is_debug = false
+            target_cpu = "arm64"
+            symbol_level = 0
+            blink_symbol_level = 0
+            is_component_build = false
+            EOF
           fi
-          echo "TAR_ARTIFACT=${TAR_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Create release and upload artifact(s)
-        id: create_release
+      - name: Optionally create swap (if memory low)
+        if: ${{ env.USE_SWAP == 'true' }}
+        run: |
+          # 仅在 self-hosted 上运行：为避免 OOM，创建 swapfile（注意：检查磁盘空间）
+          set -eux
+          SWAP_GB=${{ env.SWAP_SIZE_GB }}
+          SWAP_FILE=/swapfile_github_actions
+          if [ ! -f "$SWAP_FILE" ]; then
+            sudo fallocate -l ${SWAP_GB}G $SWAP_FILE
+            sudo chmod 600 $SWAP_FILE
+            sudo mkswap $SWAP_FILE
+            sudo swapon $SWAP_FILE
+            echo "Swapfile created and enabled: $SWAP_FILE ${SWAP_GB}G"
+          else
+            echo "Swapfile already exists"
+          fi
+          free -h
+
+      - name: GN gen and build (ninja)
+        run: |
+          set -eux
+          cd ${{ env.SRC_DIR }}
+          # 确保 args.gn 存在（上一步已处理）
+          ./out/Default/gn gen out/Default --fail-on-unused-args
+          # 使用 NINJA_JOBS 控制并发，内存小就减小它
+          ninja -C out/Default -j${{ env.NINJA_JOBS }} chrome chromedriver chrome_sandbox || (echo "build failed"; exit 1)
+        working-directory: ${{ github.workspace }}
+
+      - name: Pack build artifacts
+        run: |
+          set -eux
+          cd ${{ env.SRC_DIR }}
+          TAR_PATH="$GITHUB_WORKSPACE/${{ env.TAR_NAME }}"
+          # 选择性打包 chrome 可执行与 lib 以及必要资源，避免打包整个 out 目录
+          # 下面是示例，按实际文件位置调整
+          tar -cJf "$TAR_PATH" -C out/Default chrome chrome_sandbox chromedriver || \
+            ( echo "pack fallback: pack entire out/Default (may be large)"; tar -cJf "$TAR_PATH" -C out/Default . )
+          ls -lh "$TAR_PATH"
+          echo "TAR=$TAR_PATH" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub release & upload artifact
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: v${{ github.run_number }}-chromium-arm64
-          name: chromium-arm64-glibc2.28-${{ github.run_number }}
-          body: |
-            Automated build (may be empty placeholder if build didn't run on hosted runner).
-          files: |
-            ${{ steps.pack_artifact.outputs.TAR_ARTIFACT || env.GITHUB_WORKSPACE }}/chromium-arm64-glibc2.28-${{ github.run_number }}.tar.xz
+          tag_name: v${{ github.run_number }}-ungoogled-arm64
+          name: ungoogled-chromium-arm64-${{ github.run_number }}
+          body: "ungoogled-chromium (arm64) build - automated"
+          files: ${{ steps.pack_build_artifacts.outputs.TAR || env.GITHUB_WORKSPACE }}/{{ env.TAR_NAME }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
