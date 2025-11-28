@@ -1,0 +1,84 @@
+name: cross-build-chromium-arm64-glibc2.28
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cross_build:
+    runs-on: ubuntu-22.04
+    env:
+      DEPOT_TOOLS: ${{ runner.temp }}/depot_tools
+      OUTDIR: out/arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip git curl cmake ninja-build \
+            pkg-config wget xz-utils build-essential
+      - name: Get depot_tools
+        run: |
+          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git $DEPOT_TOOLS
+          echo "$DEPOT_TOOLS" >> $GITHUB_PATH
+
+      - name: Fetch chromium (nohooks)
+        run: |
+          fetch --nohooks chromium
+          cd src
+          gclient sync --with_branch_heads --no-history
+        working-directory: ${{ github.workspace }}
+
+      - name: Install sysroot for arm64 (use chromium sysroot)
+        run: |
+          cd src
+          # 这里我们用 chromium 的 sysroot installer then override to use a debian buster sysroot if needed.
+          python3 build/linux/sysroot_scripts/install-sysroot.py --arch=arm64
+          # OPTIONAL: if you have a custom sysroot tarball built from Debian Buster, extract it into src/third_party/sysroot_*
+        working-directory: ${{ github.workspace }}
+
+      - name: Configure GN (target sysroot for Debian Buster)
+        run: |
+          cd src
+          mkdir -p ${OUTDIR}
+          cat > ${OUTDIR}/args.gn <<'EOF'
+          target_cpu = "arm64"
+          is_debug = false
+          symbol_level = 0
+          target_sysroot = "//third_party/linux-sysroot:sysroot_aarch64"  # adjust if you provided custom sysroot target
+          is_component_build = false
+          EOF
+          gclient runhooks
+        working-directory: ${{ github.workspace }}
+
+      - name: Build (may be huge & long)
+        run: |
+          cd src
+          gn gen ${OUTDIR} --args="$(cat ${OUTDIR}/args.gn)"
+          autoninja -C ${OUTDIR} chrome
+        working-directory: ${{ github.workspace }}
+
+      - name: Pack artifact
+        run: |
+          cd src/${{ env.OUTDIR }}
+          tar -cJf $GITHUB_WORKSPACE/chromium-arm64-glibc2.28.tar.xz *
+      - name: Create release
+        id: create_release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: v${{ github.run_number }}-chromium-arm64
+          name: chromium-arm64-glibc2.28-${{ github.run_number }}
+          body: "Chromium arm64 (built against glibc 2.28 sysroot)"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload asset
+        uses: actions/upload-release-asset@v2
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: chromium-arm64-glibc2.28.tar.xz
+          asset_name: chromium-arm64-glibc2.28.tar.xz
+          asset_content_type: application/x-xz
