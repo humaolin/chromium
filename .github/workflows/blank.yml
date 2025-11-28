@@ -8,7 +8,7 @@ jobs:
   cross_build:
     runs-on: ubuntu-22.04
     env:
-      DEPOT_TOOLS: ${{ runner.temp }}/depot_tools
+      DEPOT_TOOLS: $RUNNER_TEMP/depot_tools
       OUTDIR: out/arm64
     steps:
       - name: Checkout
