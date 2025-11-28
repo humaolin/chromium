@@ -1,148 +1,115 @@
 name: Build ungoogled-chromium (arm64)
 
-# 手动触发 + push 到 main 时触发
 on:
-  workflow_dispatch:
   push:
-    branches: [ main ]
+    branches-ignore:
+      - master
+  workflow_call:
 
-# 如果你有可用的 GitHub-hosted ARM runner，修改 runs-on 为对应名称（示例使用 ubuntu-22.04-arm）
-# 如果没有，请使用自托管 runner 标签（例如: self-hosted, linux, aarch64）
 jobs:
-  build-arm64:
-    name: Build ungoogled-chromium (arm64)
-    runs-on: ubuntu-22.04-arm   # <- 若报错，请换成可用的 arm runner 或自托管 runner 标签
-    timeout-minutes: 720        # Chromium 构建很耗时，必要时调整
-
-    env:
-      # 可按需修改
-      DEPOT_TOOLS_DIR: ${{ runner.temp }}/depot_tools
-      CHROMIUM_OUT: out/Default
-      # 若你希望构建 debug 或 release，可改 is_debug=true/false
-      GN_ARGS: 'target_cpu="arm64" is_debug=false treat_warnings_as_errors=false symbol_level=0'
-
+  build:
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout this repository (ungoogled-chromium)
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v3
+      - uses: actions/setup-node@v4
         with:
-          repository: ungoogled-software/ungoogled-chromium
-          # 如果 workflow 在同一仓库里，去掉 repository 字段即可
-          # repository: <omit when workflow in same repo>
-          ref: main
-          token: ${{ secrets.GITHUB_TOKEN }}
-          submodules: recursive
-          fetch-depth: 0
-
-      - name: Cache depot_tools
-        id: cache-depot
-        uses: actions/cache@v4
+          node-version-file: 'package.json'
+          cache: 'pnpm'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm package
+      - uses: actions/upload-artifact@v4
         with:
-          path: ${{ runner.temp }}/depot_tools
-          key: depot-tools-${{ runner.os }}-v1
+          name: dist
+          path: ./dist/
 
-      - name: Clone depot_tools (if cache miss)
-        if: steps.cache-depot.outputs.cache-hit != 'true'
+  test:
+    needs: [build]
+    strategy:
+      matrix:
+        os: [ubuntu, macos, windows]
+        version: ["", 1295939, 120, dev, latest]
+    runs-on: ${{ matrix.os }}-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+
+      - name: Install Google Chrome
+        uses: ./
+        with:
+          chrome-version: ${{ matrix.version }}
+          install-chromedriver: true
+        id: setup-chrome
+      - if: runner.os == 'Linux' || runner.os == 'macOS'
         run: |
-          git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "${DEPOT_TOOLS_DIR}"
-          echo "${DEPOT_TOOLS_DIR}" >> $GITHUB_PATH
-        shell: bash
-
-      - name: Ensure depot_tools on PATH
+          "${{ steps.setup-chrome.outputs.chrome-path }}" --version
+          "${{ steps.setup-chrome.outputs.chromedriver-path }}" --version
+      - if: runner.os == 'Windows'
         run: |
-          # if depot_tools already in cache, make sure to add it to PATH too
-          if [ -d "${DEPOT_TOOLS_DIR}" ]; then
-            echo "${DEPOT_TOOLS_DIR}" >> $GITHUB_PATH
-          fi
-          echo "depot_tools in PATH: $(which gclient || true)"
-        shell: bash
+          (Get-Item (Get-Command "${{ steps.setup-chrome.outputs.chrome-path }}").Source).VersionInfo.ProductVersion
+          (Get-Item (Get-Command "${{ steps.setup-chrome.outputs.chromedriver-path }}").Source).VersionInfo.ProductVersion
 
-      - name: Install apt packages (prerequisites)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y git python3 python3-pip cmake ninja-build \
-            clang lld pkg-config build-essential curl unzip python-is-python3 \
-            ca-certificates
-          # 依据你要构建的目标平台与 building.md，可能需要添加 pkg-config libgtk-3-dev 等包
-        shell: bash
+  test-windows-arm:
+    needs: [build]
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
 
-      - name: Configure git (avoid quota prompts)
-        run: |
-          git config --global --add safe.directory $GITHUB_WORKSPACE
-        shell: bash
-      - name: Ensure cipd client (for linux/arm64)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # 设定 DEPOT_TOOLS_DIR（与你 workflow 中的同名 env 保持一致）
-          DEPOT_TOOLS_DIR="${{ runner.temp }}/depot_tools"
-          mkdir -p "${DEPOT_TOOLS_DIR}"
-          # 选择合适的平台标识（github runner 上 arm64 通常是 linux-arm64）
-          PLATFORM="linux-arm64"
-          # CIPD backend URL (depot_tools bootstrap 脚本也是用类似的 URL)
-          CIPD_BACKEND="https://chrome-infra-packages.appspot.com"
-          # 下载 endpoint: /client?platform=<platform>&version=git_revision:<any>
-          # 这里用 curl 下载最新可用客户端二进制（bootstrap 脚本也类似）
-          CIPD_URL="${CIPD_BACKEND}/client?platform=${PLATFORM}"
-          echo "Downloading cipd from: ${CIPD_URL}"
-          # 跳过证书问题时请谨慎；默认 curl 应该可用
-          curl -fLsS -o "${DEPOT_TOOLS_DIR}/cipd" "${CIPD_URL}"
-          chmod +x "${DEPOT_TOOLS_DIR}/cipd"
-          # 让后续步骤能直接使用 cipd & gclient
-          echo "${DEPOT_TOOLS_DIR}" >> $GITHUB_PATH
-          echo "cipd installed to ${DEPOT_TOOLS_DIR}/cipd"
-      - name: Fetch Chromium and sync deps (ensure cipd)
-        shell: bash
-        run: |
-          set -euo pipefail
-          # 设置 depot_tools 目录
-          DEPOT_TOOLS="$RUNNER_TEMP/depot_tools"
-          mkdir -p "$DEPOT_TOOLS"
-          export PATH="$DEPOT_TOOLS:$PATH"
+      - name: Install Google Chrome
+        uses: ./
+        with:
+          chrome-version: 1485971
+          install-chromedriver: true
+        id: setup-chrome
+      - run: |
+          (Get-Item (Get-Command "${{ steps.setup-chrome.outputs.chrome-path }}").Source).VersionInfo.ProductVersion
+          (Get-Item (Get-Command "${{ steps.setup-chrome.outputs.chromedriver-path }}").Source).VersionInfo.ProductVersion
 
-          # 下载 cipd
-          curl -fLsS "https://chrome-infra-packages.appspot.com/client?platform=linux-arm64" -o "$DEPOT_TOOLS/cipd"
-          chmod +x "$DEPOT_TOOLS/cipd"
+  test-install-dependencies:
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        container:
+          - ""
+          - fedora
+          - opensuse/leap
+    runs-on: ubuntu-latest
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+      - name: Install action dependencies
+        run: apt-get update && apt-get install -y unzip
+        if: ${{ matrix.container == 'debian' || matrix.container == 'ubuntu' || matrix.container == 'linuxmintd/mint21-amd64' }}
+      - name: Install action dependencies
+        run: yum install --assumeyes unzip
+        if: ${{ matrix.container == 'redhat/ubi9' || matrix.container == 'oraclelinux:9' || matrix.container == 'fedora' }}
+      - name: Install action dependencies
+        run: zypper install --no-confirm unzip
+        if: ${{ matrix.container == 'opensuse/leap' || matrix.container == 'registry.suse.com/bci/bci-base:15.5' }}
 
-          # 验证 cipd
-          which cipd
+      # Override GITHUB_PATH by the current PATH to prevent the issue discussed in https://github.com/actions/runner/issues/3210
+      - run: echo "$PATH" >>"$GITHUB_PATH"
+        if: ${{ matrix.container == 'opensuse/leap' || matrix.container == 'registry.suse.com/bci/bci-base:15.5' }}
 
-          # 拉源码
-          fetch --nohooks chromium
-          cd src
-
-          # 同步依赖
-          gclient sync --with_branch_heads --no-history
-        shell: bash
-
-      - name: Prepare GN args
-        run: |
-          cd $GITHUB_WORKSPACE
-          export PATH="${DEPOT_TOOLS_DIR}:$PATH"
-          mkdir -p ${CHROMIUM_OUT}
-          # Write GN args - you can extend GN_ARGS via workflow env or secrets
-          echo "${{ env.GN_ARGS }}" > ${CHROMIUM_OUT}/args.gn
-          cat ${CHROMIUM_OUT}/args.gn
-        shell: bash
-
-      - name: Generate build files (gn gen)
-        run: |
-          cd $GITHUB_WORKSPACE
-          export PATH="${DEPOT_TOOLS_DIR}:$PATH"
-          gn gen ${CHROMIUM_OUT} --check --fail-on-unused-args || true
-          # If above fails due to missing args, the args.gn file will be used by gn automatically
-        shell: bash
-
-      - name: Build (autoninja)
-        run: |
-          cd $GITHUB_WORKSPACE
-          export PATH="${DEPOT_TOOLS_DIR}:$PATH"
-          # autoninja is a wrapper; fallback to ninja if needed
-          if command -v autoninja >/dev/null 2>&1; then
-            autoninja -C ${CHROMIUM_OUT} -j 8 chrome
-          else
-            ninja -C ${CHROMIUM_OUT} -j 8 chrome
-          fi
-        shell: bash
+      - name: Install Google Chrome
+        uses: ./
+        with:
+          chrome-version: 120
+          install-chromedriver: true
+          install-dependencies: true
+        id: setup-chrome
+      - run: |
+          "${{ steps.setup-chrome.outputs.chrome-path }}" --version
+          "${{ steps.setup-chrome.outputs.chromedriver-path }}" --version
 
       - name: Package / gather artifacts
         run: |
