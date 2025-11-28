@@ -19,63 +19,77 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install minimal packages
+      - name: Install OS deps (python venv + essentials)
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 python3-pip git curl ca-certificates unzip xz-utils \
-            build-essential pkg-config cmake ninja-build wget
-      - name: Prepare depot_tools dir and add to PATH
+          sudo apt-get install -y python3 python3-pip python3-venv python3-virtualenv \
+            git curl ca-certificates unzip xz-utils build-essential
+
+      - name: Prepare depot_tools and add to PATH
         run: |
+          DEPOT_TOOLS="$RUNNER_TEMP/depot_tools"
           rm -rf "$DEPOT_TOOLS"
           git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git "$DEPOT_TOOLS"
           chmod -R a+x "$DEPOT_TOOLS" || true
           echo "$DEPOT_TOOLS" >> $GITHUB_PATH
-          echo "DEPOT_TOOLS set to $DEPOT_TOOLS"
-      - name: Bootstrap depot_tools (update_depot_tools / install helpers)
+          echo "Added depot_tools to PATH: $DEPOT_TOOLS"
+
+      - name: Try update_depot_tools (may install cipd/vpython)
         run: |
           set -eux
-          # Try common updater scripts - some depot_tools versions differ
-          if [ -x "$DEPOT_TOOLS/update_depot_tools" ]; then
-            "$DEPOT_TOOLS/update_depot_tools" || true
+          DT="$RUNNER_TEMP/depot_tools"
+          if [ -x "$DT/update_depot_tools" ]; then
+            "$DT/update_depot_tools" || true
           fi
-          if [ -f "$DEPOT_TOOLS/update_depot_tools.py" ]; then
-            python3 "$DEPOT_TOOLS/update_depot_tools.py" || true
+          if [ -f "$DT/update_depot_tools.py" ]; then
+            python3 "$DT/update_depot_tools.py" || true
           fi
-          # Some depot_tools use fetch to get vpython/cipd. Ensure python3 is default for vpython scripts.
-      - name: Fallback: download cipd binary if missing
+          # small sleep for filesystem to settle
+          sleep 1
+
+      - name: Ensure cipd in PATH (fallback download)
         run: |
           set -eux
+          # make bin dir in runner temp and add to PATH
+          mkdir -p "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> $GITHUB_PATH
+
           if command -v cipd >/dev/null 2>&1; then
-            echo "cipd already available at $(command -v cipd)"
+            echo "cipd already present at $(command -v cipd)"
             cipd --version || true
           else
-            echo "cipd NOT found in PATH, attempting direct download fallback..."
-            mkdir -p "$RUNNER_TEMP/bin"
-            # Use chrome infra packages endpoint - choose linux-amd64 for ubuntu-22.04 hosted runner
-            CIPD_URL="https://chrome-infra-packages.appspot.com/dl/infra/tools/cipd/linux-amd64/latest"
-            curl -fSL "$CIPD_URL" -o "$RUNNER_TEMP/bin/cipd"
+            echo "cipd not found — downloading fallback binary"
+            ARCH="$(uname -m)"
+            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
+              CIPD_TARGET="linux-amd64"
+            elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+              CIPD_TARGET="linux-arm64"
+            else
+              echo "Unsupported arch: $ARCH" && exit 1
+            fi
+            CIPD_URL="https://chrome-infra-packages.appspot.com/dl/infra/tools/cipd/${CIPD_TARGET}/latest"
+            curl -fsSL "$CIPD_URL" -o "$RUNNER_TEMP/bin/cipd"
             chmod +x "$RUNNER_TEMP/bin/cipd"
-            echo "$RUNNER_TEMP/bin" >> $GITHUB_PATH
             echo "Downloaded cipd to $RUNNER_TEMP/bin/cipd"
             cipd --version || true
           fi
 
-      - name: Verify cipd and depot_tools in PATH
+      - name: Verify cipd & depot_tools tools
         run: |
           set -eux
           echo "PATH=$PATH"
-          which cipd || (echo "cipd not found - aborting" && exit 1)
-          which gclient || echo "warning: gclient not in PATH"
-          cipd --version || true
+          which cipd || (echo "ERROR: cipd missing" && exit 1)
+          cipd --version
+          which fetch || echo "warning: fetch (depot_tools) not found in PATH"
+          which gclient || echo "warning: gclient not found in PATH"
 
-      - name: Fetch chromium (requires cipd available)
+      - name: Fetch chromium (nohooks)
         run: |
           set -eux
-          # fetch is provided by depot_tools (we added it to PATH via GITHUB_PATH)
-          # --nohooks 避免立即运行 gclient hooks（我们会显式 runhooks / gclient sync 后处理）
+          # fetch provided by depot_tools; requires cipd in PATH
           fetch --nohooks chromium
           cd src
-          # gclient sync will use cipd to pull binary deps
+          # gclient sync uses cipd to pull binary deps
           gclient sync --with_branch_heads --no-history
         working-directory: ${{ github.workspace }}
 
