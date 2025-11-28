@@ -1,3 +1,4 @@
+
 name: cross-build-chromium-arm64-glibc2.28
 
 on:
@@ -7,7 +8,7 @@ jobs:
   cross_build:
     runs-on: ubuntu-22.04
     env:
-      DEPOT_TOOLS: $RUNNER_TEMP/depot_tools
+      DEPOT_TOOLS: ${{ runner.temp }}/depot_tools
       OUTDIR: out/arm64
     steps:
       - name: Checkout
@@ -60,12 +61,12 @@ jobs:
           gn gen ${OUTDIR} --args="$(cat ${OUTDIR}/args.gn)"
           autoninja -C ${OUTDIR} chrome
         working-directory: ${{ github.workspace }}
-
       - name: Pack artifact
         run: |
           cd src/${{ env.OUTDIR }}
+          # 打包出一个单文件，upload-release-asset 只能上传文件
           tar -cJf $GITHUB_WORKSPACE/chromium-arm64-glibc2.28.tar.xz *
-      - name: Create release
+      - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v1
         with:
@@ -75,10 +76,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Upload asset
-        uses: actions/upload-release-asset@v2
+      - name: Upload asset to release
+        uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: chromium-arm64-glibc2.28.tar.xz
+          asset_path: $GITHUB_WORKSPACE/chromium-arm64-glibc2.28.tar.xz
           asset_name: chromium-arm64-glibc2.28.tar.xz
           asset_content_type: application/x-xz
