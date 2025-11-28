@@ -94,15 +94,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DEPOT_TOOLS="${RUNNER_TEMP}/depot_tools"
-          mkdir -p "${DEPOT_TOOLS}"
-          export PATH="${DEPOT_TOOLS}:$PATH"
+          # 设置 depot_tools 目录
+          DEPOT_TOOLS="$RUNNER_TEMP/depot_tools"
+          mkdir -p "$DEPOT_TOOLS"
+          export PATH="$DEPOT_TOOLS:$PATH"
 
           # 下载 cipd
-          curl -fLsS "https://chrome-infra-packages.appspot.com/client?platform=linux-arm64" -o "${DEPOT_TOOLS}/cipd"
-          chmod +x "${DEPOT_TOOLS}/cipd"
+          curl -fLsS "https://chrome-infra-packages.appspot.com/client?platform=linux-arm64" -o "$DEPOT_TOOLS/cipd"
+          chmod +x "$DEPOT_TOOLS/cipd"
 
-          # 确认 cipd 可用
+          # 验证 cipd
           which cipd
 
           # 拉源码
